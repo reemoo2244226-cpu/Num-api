@@ -10,25 +10,24 @@ import uvicorn
 app = FastAPI(
     title="Info Lookup API",
     description="Mobile number + Aadhaar family info",
-    version="6.0.0",
+    version="7.0.0",
 )
 
 # ---------- Config ----------
 NUMBER_API_URL = "https://api.naxupdate.workers.dev/api/number-info"
 NUMBER_API_KEY = "30Day"
 
-# NAYA FAMILY API — Dark API Hub
 FAMILY_API_URL = "https://dark-api-hub.onrender.com/api/adharfamily"
 FAMILY_API_KEY = "DEMO"
 
 YOUR_CREDIT = "@YoBlackX"
 DEVELOPER = "YoBlackX"
-REQUEST_TIMEOUT = 40
+REQUEST_TIMEOUT = 60  # Render cold start ke liye 60 kar diya
 MAX_RECORDS = 5
 
 
 # ============================================================
-#                     NUMBER INFO SECTION (unchanged)
+#                     NUMBER INFO SECTION
 # ============================================================
 
 async def call_number_upstream(number: str) -> dict:
@@ -138,7 +137,7 @@ def format_number_pretty(data: dict) -> str:
 
 
 # ============================================================
-#                     FAMILY INFO SECTION (NEW API)
+#                     FAMILY INFO SECTION (UPDATED)
 # ============================================================
 
 async def call_family_upstream(aadhar: str) -> dict:
@@ -151,7 +150,7 @@ async def call_family_upstream(aadhar: str) -> dict:
             r.raise_for_status()
             return r.json()
     except httpx.TimeoutException:
-        return {"_error": "Upstream timeout. Dobara try karo."}
+        return {"_error": "Upstream timeout. Render API slow ho sakti hai, dobara try karein."}
     except httpx.HTTPError as e:
         return {"_error": f"Upstream request failed: {str(e)}"}
     except ValueError:
@@ -165,132 +164,59 @@ REL_EMOJI = {
 }
 
 
-def _first(d: dict, *keys, default="N/A"):
-    """Helper: pehla non-empty key value return karo"""
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, "", 0):
-            return v
-    return default
-
-
-def _extract_members(raw: dict) -> list:
-    """
-    Different possible structures me se member list nikaalo:
-      1. raw["data"]["ALL-DETAILS"]["memberDetailsList"]  (purana dark-info)
-      2. raw["data"]["members"] / memberList / result
-      3. raw["data"] (list directly)
-      4. raw["members"] / raw["result"]
-      5. raw (agar root list hai to — caller handle karta hai)
-    """
-    if not isinstance(raw, dict):
-        return []
-
-    # path 1: nested ALL-DETAILS
-    dn = raw.get("data")
-    if isinstance(dn, dict):
-        for ck in ("ALL-DETAILS", "allDetails", "all_details"):
-            cd = dn.get(ck)
-            if isinstance(cd, dict):
-                for mk in ("memberDetailsList", "members", "memberList", "result"):
-                    mv = cd.get(mk)
-                    if isinstance(mv, list):
-                        return mv
-        # path 2: direct members under data
-        for mk in ("members", "memberList", "memberDetailsList", "result", "records"):
-            mv = dn.get(mk)
-            if isinstance(mv, list):
-                return mv
-
-    # path 3: data is a list
-    if isinstance(dn, list):
-        return dn
-
-    # path 4: top-level members
-    for mk in ("members", "memberList", "result", "records", "data"):
-        mv = raw.get(mk)
-        if isinstance(mv, list):
-            return mv
-
-    return []
-
-
-def _extract_ration_card(raw: dict) -> dict:
-    """Ration card details nikaalo (nested ya flat)"""
-    dn = raw.get("data") if isinstance(raw, dict) else None
-    if isinstance(dn, dict):
-        for ck in ("ALL-DETAILS", "allDetails", "all_details"):
-            cd = dn.get(ck)
-            if isinstance(cd, dict):
-                return cd
-        return dn
-    return raw if isinstance(raw, dict) else {}
-
-
 def clean_family_member(m: dict) -> dict:
     if not isinstance(m, dict):
         return {}
-    rel = _first(m, "releationship_name", "relationship_name", "relationship",
-                 "relation", default="N/A")
+    rel = (m.get("releationship_name") or m.get("relationship_name") or "N/A").upper()
     return {
-        "name": _first(m, "memberName", "member_name", "name"),
-        "relationship": str(rel).upper(),
-        "masked_aadhar": _first(m, "maskedUid", "masked_aadhar", "aadhaar", "uid"),
-        "member_id": _first(m, "memberId", "member_id", "id"),
-        "has_uid": _first(m, "uid", "has_uid"),
+        "name": m.get("memberName") or "N/A",
+        "relationship": rel,
+        "masked_aadhar": m.get("maskedUid") or "N/A", # Is API mein maskedUid nahi hai, N/A dikhayega
+        "member_id": m.get("memberId") or "N/A",
+        "has_uid": m.get("uid") or "N/A",
     }
 
 
-def build_family_response(aadhar: str, raw) -> dict:
-    # Error
-    if isinstance(raw, dict) and "_error" in raw:
+def build_family_response(aadhar: str, raw: dict) -> dict:
+    if "_error" in raw:
         return {"success": False, "credit": YOUR_CREDIT, "developer": DEVELOPER,
                 "query": aadhar, "message": raw["_error"]}
 
-    # Failure status check (multiple possible flag names)
-    if isinstance(raw, dict):
-        status_val = str(_first(raw, "status", "success", "ok", default="")).lower()
-        if status_val in ("false", "failed", "error", "0"):
-            msg = _first(raw, "M-S-G", "message", "msg", "error", default="No data found")
-            return {"success": False, "credit": YOUR_CREDIT, "developer": DEVELOPER,
-                    "query": aadhar, "message": msg}
-
-    # Member list nikaalo
-    if isinstance(raw, list):
-        members_raw = raw
-    else:
-        members_raw = _extract_members(raw)
-
-    if not members_raw:
-        msg = "No family details found"
-        if isinstance(raw, dict):
-            msg = _first(raw, "M-S-G", "message", "msg",
-                         "N-A", default=msg)
+    if raw.get("status", "").lower() != "success":
         return {"success": False, "credit": YOUR_CREDIT, "developer": DEVELOPER,
-                "query": aadhar, "message": msg}
+                "query": aadhar, "message": raw.get("message", "No data found")}
+
+    # Naye API ke hisaab se data nikalna
+    pd_node = raw.get("data", {}).get("pd", {})
+    members_raw = pd_node.get("memberDetailsList", [])
+    
+    if not isinstance(members_raw, list) or not members_raw:
+        return {"success": False, "credit": YOUR_CREDIT, "developer": DEVELOPER,
+                "query": aadhar, "message": "No family details found"}
 
     members = [clean_family_member(m) for m in members_raw]
     members = [m for m in members if m]
+
+    # SELF ko pehle rakho, baaki alphabetical
     members.sort(key=lambda x: (0 if x["relationship"] == "SELF" else 1, x["name"]))
 
-    # Ration card block
-    rc_raw = _extract_ration_card(raw) if isinstance(raw, dict) else {}
-    ration_card = {
-        "rc_id": _first(rc_raw, "rcId", "rc_id", "ration_card_id"),
-        "scheme": _first(rc_raw, "schemeName", "scheme_name", "scheme"),
-        "fps_id": _first(rc_raw, "fpsId", "fps_id"),
-        "address": _first(rc_raw, "address", "addr"),
-        "district": _first(rc_raw, "homeDistName", "district", "dist_name"),
-        "state": _first(rc_raw, "homeStateName", "state", "state_name"),
-        "onorc_allowed": _first(rc_raw, "allowed_onorc", "onorc", "onorc_allowed"),
-    }
-
-    ts = _first(raw, "timestamp", "time", "fetched_at") if isinstance(raw, dict) else "N/A"
-
     return {
-        "success": True, "credit": YOUR_CREDIT, "developer": DEVELOPER,
-        "query": aadhar, "total_members": len(members),
-        "ration_card": ration_card, "members": members, "timestamp": ts,
+        "success": True, 
+        "credit": YOUR_CREDIT, 
+        "developer": DEVELOPER,
+        "query": aadhar, 
+        "masked_aadhaar": raw.get("aadhaar", "N/A"),
+        "total_members": len(members),
+        "ration_card": {
+            "rc_id": pd_node.get("rcId", raw.get("ration_card", "N/A")),
+            "scheme": pd_node.get("schemeName", "N/A"),
+            "fps_id": pd_node.get("fpsId", "N/A"),
+            "address": pd_node.get("address", "N/A"),
+            "district": pd_node.get("homeDistName", "N/A"),
+            "state": pd_node.get("homeStateName", "N/A"),
+            "onorc_allowed": pd_node.get("allowed_onorc", "N/A"),
+        },
+        "members": members,
     }
 
 
@@ -307,26 +233,22 @@ def format_family_pretty(data: dict) -> str:
     lines = [
         "👨‍👩‍👧‍👦 *FAMILY INFO LOOKUP*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🔍 *Aadhaar:* `{data.get('query')}`",
+        f"🔍 *Query:* `{data.get('query')}`",
+        f"🆔 *Aadhaar:* `{data.get('masked_aadhaar')}`",
         f"👥 *Members:* {data.get('total_members', 0)}",
         "",
+        "🏠 *RATION CARD DETAILS*",
+        f"🆔 *RC ID:* `{rc.get('rc_id')}`",
+        f"📋 *Scheme:* {rc.get('scheme')}",
+        f"🏪 *FPS ID:* `{rc.get('fps_id')}`",
+        f"📍 *Address:* {str(rc.get('address'))[:120]}",
+        f"🗺️ *District:* {rc.get('district')}",
+        f"🏛️ *State:* {rc.get('state')}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "👥 *FAMILY MEMBERS*",
+        "",
     ]
-
-    # Sirf tab dikhao jab ration card data ho
-    if any(rc.get(k) not in (None, "", "N/A") for k in
-           ("rc_id", "scheme", "fps_id", "address", "district", "state")):
-        lines += [
-            "🏠 *RATION CARD DETAILS*",
-            f"🆔 *RC ID:* `{rc.get('rc_id')}`",
-            f"📋 *Scheme:* {rc.get('scheme')}",
-            f"🏪 *FPS ID:* `{rc.get('fps_id')}`",
-            f"📍 *Address:* {str(rc.get('address'))[:120]}",
-            f"🗺️ *District:* {rc.get('district')}",
-            f"🏛️ *State:* {rc.get('state')}",
-            "━━━━━━━━━━━━━━━━━━━━",
-        ]
-
-    lines += ["👥 *FAMILY MEMBERS*", ""]
 
     for i, m in enumerate(members, 1):
         emoji = REL_EMOJI.get(m["relationship"], "👤")
@@ -334,14 +256,12 @@ def format_family_pretty(data: dict) -> str:
             f"┌─── *MEMBER {i}* ───┐",
             f"{emoji} *Name:* {m.get('name')}",
             f"🔗 *Relation:* {m.get('relationship')}",
-            f"🆔 *Masked Aadhaar:* `{m.get('masked_aadhar')}`",
             f"🪪 *Member ID:* `{m.get('member_id')}`",
             "└─────────────────────┘", "",
         ]
 
     lines += [
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 *Timestamp:* {data.get('timestamp', 'N/A')}",
         f"💠 *Credit:* {data.get('credit', YOUR_CREDIT)}",
         f"✦ *Developer:* {data.get('developer', DEVELOPER)}",
     ]
@@ -397,7 +317,7 @@ async def familyinfo_pretty(aadhar: str = Query(..., description="12-digit Aadha
 @app.get("/")
 async def index():
     return {
-        "name": "Info Lookup API", "version": "6.0.0",
+        "name": "Info Lookup API", "version": "7.0.0",
         "credit": YOUR_CREDIT, "developer": DEVELOPER,
         "endpoints": {
             "/lookup?number=<10digit>": "Mobile → JSON",
